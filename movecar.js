@@ -94,11 +94,11 @@ async function handleNotify(request, url) {
     const confirmUrl = encodeURIComponent(url.origin + '/owner-confirm');
 
     let notifyBody = '🚗 挪车请求';
-    if (message) notifyBody += `\\n💬 留言: ${message}`;
+    if (message) notifyBody += `\n💬 留言: ${message}`;
 
     if (location && location.lat && location.lng) {
       const urls = generateMapUrls(location.lat, location.lng);
-      notifyBody += '\\n📍 已附带位置信息，点击查看';
+      notifyBody += '\n📍 已附带位置信息，点击查看';
 
       await MOVE_CAR_STATUS.put('requester_location', JSON.stringify({
         lat: location.lat,
@@ -106,20 +106,36 @@ async function handleNotify(request, url) {
         ...urls
       }), { expirationTtl: CONFIG.KV_TTL });
     } else {
-      notifyBody += '\\n⚠️ 未提供位置信息';
+      notifyBody += '\n⚠️ 未提供位置信息';
     }
 
     await MOVE_CAR_STATUS.put('notify_status', 'waiting', { expirationTtl: 600 });
 
-    // 如果是延迟发送，等待30秒
     if (delayed) {
       await new Promise(resolve => setTimeout(resolve, 30000));
     }
 
-    const barkApiUrl = `${BARK_URL}/挪车请求/${encodeURIComponent(notifyBody)}?group=MoveCar&level=critical&call=1&sound=minuet&icon=https://cdn-icons-png.flaticon.com/512/741/741407.png&url=${confirmUrl}`;
+    // --- 修改部分开始：并发发送多种通知 ---
+    const pushTasks = [];
 
-    const barkResponse = await fetch(barkApiUrl);
-    if (!barkResponse.ok) throw new Error('Bark API Error');
+    // 1. 发送 Bark 通知 (如果配置了 BARK_URL)
+    if (typeof BARK_URL !== 'undefined' && BARK_URL) {
+      pushTasks.push(sendBark(notifyBody, confirmUrl));
+    }
+
+    // 2. 发送 Telegram 通知 (如果配置了 TG_BOT_TOKEN 和 TG_CHAT_ID)
+    if (typeof TG_BOT_TOKEN !== 'undefined' && TG_BOT_TOKEN && typeof TG_CHAT_ID !== 'undefined') {
+      pushTasks.push(sendTelegram(notifyBody, decodeURIComponent(confirmUrl)));
+    }
+
+    // 3. 发送 PushPlus 微信通知 (如果配置了 PUSHPLUS_TOKEN)
+    if (typeof PUSHPLUS_TOKEN !== 'undefined' && PUSHPLUS_TOKEN) {
+      pushTasks.push(sendPushPlus('🚨 挪车请求', notifyBody, decodeURIComponent(confirmUrl)));
+    }
+
+    // 使用 Promise.allSettled 确保某个推送失败不会影响其他推送
+    await Promise.allSettled(pushTasks);
+    // --- 修改部分结束 ---
 
     return new Response(JSON.stringify({ success: true }), {
       headers: { 'Content-Type': 'application/json' }
@@ -1142,4 +1158,55 @@ function renderOwnerPage() {
   </html>
   `;
   return new Response(html, { headers: { 'Content-Type': 'text/html;charset=UTF-8' } });
+}
+// --- Bark 推送 ---
+async function sendBark(notifyBody, confirmUrl) {
+  try {
+    const barkApiUrl = `${BARK_URL}/挪车请求/${encodeURIComponent(notifyBody)}?group=MoveCar&level=critical&call=1&sound=minuet&icon=https://cdn-icons-png.flaticon.com/512/741/741407.png&url=${confirmUrl}`;
+    await fetch(barkApiUrl);
+  } catch (e) {
+    console.error("Bark Error:", e);
+  }
+}
+
+// --- Telegram Bot 推送 ---
+async function sendTelegram(text, confirmUrl) {
+  try {
+    const tgUrl = `https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage`;
+    const messageText = `🚨 <b>收到新的挪车请求</b>\n\n<pre>${text}</pre>\n\n<a href="${confirmUrl}">👉 点击此处确认正在前往</a>`;
+    
+    await fetch(tgUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        chat_id: TG_CHAT_ID,
+        text: messageText,
+        parse_mode: 'HTML',
+        disable_web_page_preview: true
+      })
+    });
+  } catch (e) {
+    console.error("Telegram Error:", e);
+  }
+}
+
+// --- PushPlus 微信推送 ---
+async function sendPushPlus(title, content, confirmUrl) {
+  try {
+    const url = 'http://www.pushplus.plus/send';
+    const htmlContent = `<div><pre>${content}</pre><br/><a href="${confirmUrl}" style="color:#0093E9;font-weight:bold;">👉 点击此处确认您正在前往</a></div>`;
+    
+    await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        token: PUSHPLUS_TOKEN,
+        title: title,
+        content: htmlContent,
+        template: 'html'
+      })
+    });
+  } catch (e) {
+    console.error("PushPlus Error:", e);
+  }
 }
